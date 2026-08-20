@@ -1,11 +1,14 @@
 # Fast Tendermint
 
+> **Research code.** This repo contains code for academic research.
+> The code is not deployed, not a production system, and not maintained.
+
 A variation of [Tendermint](https://arxiv.org/abs/1807.04938) that achieves consensus
 in two communication steps while tolerating `f < n/5` Byzantine processes (vs. the
 standard three steps with `f < n/3`).
 
 Described in _"Fast Tendermint: Speeding Up a Foundational
-Consensus Protocol"_, DISC 2026. Full version: <arXiv link>.
+Consensus Protocol"_, DISC 2026. Full version: https://arxiv.org/pdf/2608.13434.
 
 ## Tools
 
