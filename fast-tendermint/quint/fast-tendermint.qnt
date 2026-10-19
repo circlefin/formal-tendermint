@@ -321,9 +321,10 @@ module fast_tendermint {
 	}
 
 	/// Observation rule pre-proposal: a value becomes valid when it receives
-	/// 2f+1 PRECOMMITs in a round; any previous round can be valid here.
+	/// 2f+1 PRECOMMITs in a round; any previous round can be valid here,
+	/// i.e., a round r with valid_p.round < r < round_p.
 	//
-	// 40: 			if 2f + 1 ⟨PRECOMMIT, r, id(v)⟩ with r > valid_p.round then
+	// 40: 			if 2f + 1 ⟨PRECOMMIT, r, id(v)⟩ with round_p > r > valid_p.round then
 	// 41: 				valid_p ← (r, id(v))
 	//
 	// If the '(valid_p.round < round_p − 1)' condition of the pseudo-code
@@ -333,7 +334,10 @@ module fast_tendermint {
 		val valid = state.valid
 		if (state.step == PreProposeStep)
 			valid_certificates(ctx).filter(
-				certificate => certificate.round > valid.round
+				certificate => all {
+					certificate.round > valid.round,
+					certificate.round < state.round,
+				}
 			)
 		else Set() // listener not currently enabled
 	}
@@ -658,9 +662,10 @@ module fast_tendermint {
 	}
 
 	/// Observation rule pre-proposal: a value becomes valid when it receives
-	/// 2f+1 PRECOMMITs in a round; any previous round can be valid here.
+	/// 2f+1 PRECOMMITs in a round; any previous round can be valid here,
+	/// i.e., a round r with valid_p.round < r < round_p.
 	//
-	// 40: 			if 2f + 1 ⟨PRECOMMIT, r, id(v)⟩ with r > valid_p.round then
+	// 40: 			if 2f + 1 ⟨PRECOMMIT, r, id(v)⟩ with round_p > r > valid_p.round then
 	// 41: 				valid_p ← (r, id(v))
 	//
 	// If the '(valid_p.round < round_p − 1)' condition of the pseudo-code
@@ -672,6 +677,7 @@ module fast_tendermint {
 		val validity_guard = all{
 			state.step == PreProposeStep,
 			round >= 0,
+            round < state.round,
 			certificate.value != Nil,
 		}
 		if (validity_guard and round > valid.round) {
