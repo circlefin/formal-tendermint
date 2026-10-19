@@ -601,9 +601,8 @@ module fast_tendermint {
 		val validity_guard = (params.proposal.valid_round == -1 and
 			round >= 0 and value != Nil)
 		if (validity_guard and state.decision == Nil) {
-			val state_update_valid = update_valid(state, round, value)
 			{
-				post_state: {...state_update_valid,
+				post_state: {...state,
 					decision: Some(params.proposal.value),
 				},
 				effects: Set(),
@@ -673,7 +672,6 @@ module fast_tendermint {
 		val validity_guard = all{
 			state.step == PreProposeStep,
 			round >= 0,
-			round < state.round,
 			certificate.value != Nil,
 		}
 		if (validity_guard and round > valid.round) {
@@ -783,6 +781,11 @@ module fast_tendermint {
 	// Safety conditions, that cannot be violated at any point of the execution.
 	// Pass `--invariant` with the invariant name to `quint run`.
 	// Multiple `--invariant` parameters can be provided.
+
+	/// Valid round bound: the round of the valid value of a correct process
+	/// is never ahead of the current round of the process.
+    // Violation found: --invariant valid_round_bounded --seed=0x7d19 --max-steps 50.
+	val valid_round_bounded = processes.forall(state => state.valid.round <= state.round)
 
 	/// Lemma 2: If 4f + 1 processes precommit for id(v) in round r (v can be
 	/// decided at round r), then no correct process sets valid = (r′, id(w))
