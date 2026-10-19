@@ -715,7 +715,7 @@ module fast_tendermint {
 	// 48:			StartRound(round + 1)
 	pure def OnTimeoutPrecommit(ctx: LocalContext, round: Round) : Transition = {
 		val state = ctx.state
-		if (state.round == round and state.decision == Nil) {
+		if (round >= state.round and state.decision == Nil) {
 			StartRound(ctx, round + 1)
 		} else {
 			no_transition(state)
