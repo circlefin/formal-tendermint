@@ -181,6 +181,37 @@ module fast_tendermint {
 			| Precommit(precommit) => Some(precommit)
 		})
 
+	/// Get the PRECOMMIT messages for `value` from a PRECOMMIT set.
+	// If the PRECOMMITs are for the same round, the senders are unique.
+	pure def precommits_for_value(precommits: Set[PrecommitMessage], value: ValueId): Set[PrecommitMessage] =
+		precommits.filter(precommit => precommit.value == value)
+
+	/// Get at most one PRECOMMIT per sender from a PRECOMMIT set.
+	// Byzantine senders may have several PRECOMMITs, for different values.
+	// Deterministic: the PRECOMMIT kept depends only on the iteration order.
+	pure def one_precommit_per_sender(precommits: Set[PrecommitMessage]): Set[PrecommitMessage] =
+		precommits.fold(Set(), (kept, precommit) =>
+			if (kept.exists(other => other.sender == precommit.sender)) kept
+			else kept.union(Set(precommit))
+		)
+
+	/// Get any element of `elements`, or `default` if it is empty.
+	// Deterministic: the choice depends only on the iteration order of the set.
+	pure def getAnyElement(elements: Set[a], default: a): a =
+		elements.fold(default, (_, element) => element)
+
+	/// Get any subset of `elements` with exactly `k` elements.
+	// Deterministic: the choice depends only on the iteration order of the set.
+	// Panics if `elements` has fewer than `k` elements.
+	pure def getAnySubset(elements: Set[a], k: int): Set[a] = {
+		val subset = elements.fold(Set(), (subset, element) =>
+			if (size(subset) < k) subset.union(Set(element))
+			else subset
+		)
+		if (size(subset) == k) subset
+		else Map().get(Set())
+	}
+
 	/// Fresh-proposal rule: process a PROPOSAL during propose round step.
 	//
 	// 18:	upon ⟨PROPOSAL, round_p, v,−1⟩ from proposer(round_p) while step_p = propose do
@@ -374,21 +405,41 @@ module fast_tendermint {
 		else Set() // listener not currently enabled
 	}
 
+
+	/// OnTimeoutPrecommit requires the round of the expired timeout and a
+	/// set of PRECOMMIT messages of that round - the quorum any messages.
+	// Conservative approach: exactly QUORUM PRECOMMITs are considered.
+	type TimeoutPrecommitParams = {
+		round:		Round,
+		precommits:	Set[PrecommitMessage],
+	}
+
 	// 46:	function OnTimeoutPrecommit(round)
 	// 47:		if round ≥ round_p ∧ decision_p = nil then
-	pure def expired_timeout_precommit(ctx: LocalContext) : Set[Round] = {
+	pure def expired_timeout_precommit(ctx: LocalContext) : Set[TimeoutPrecommitParams] = {
 		val state = ctx.state
 		// Timeouts should expire when liveness is ensured past GST
 		val liveness_guard = if (state.round >= GST_ROUND) all {
 			decision_rule(ctx).size() == 0,
 			observation_rule(ctx).size() == 0,
 		} else true // before GST, no liveness guard
-		if (state.decision == Nil and liveness_guard)
-			ctx.events.filter(timeout => all {
+		if (state.decision == Nil and liveness_guard) {
+			val rounds = ctx.events.filter(timeout => all {
 				timeout.step == PrecommitStep,
 				timeout.round >= state.round,
 			}).map(timeout => timeout.round)
-		else Set() // listener not currently enabled
+			rounds.map(round => {
+				round: round,
+				// Any QUORUM of the PRECOMMITs for the round, that must exist
+				// since the timeout was scheduled upon a QUORUM of PRECOMMITs.
+				precommits: getAnySubset(
+					one_precommit_per_sender(
+						precommits(ctx.messages).filter(precommit => precommit.round == round)
+					),
+					QUORUM
+				),
+			})
+		} else Set() // listener not currently enabled
 	}
 
 	// ========= Algorithm ========== //
@@ -711,16 +762,30 @@ module fast_tendermint {
 		}
 	}
 
-	/// Upon expiration of timeoutPrecommit(round), if still in the `precommit`
-	/// step, broadcast a PRECOMMIT for `nil` and move to `precommit` step.
+	/// Upon expiration of timeoutPrecommit(round), if the process has not
+	/// decided, update the valid value from a VALID_QUORUM of PRECOMMITs for
+	/// `round` among the QUORUM given, if any, and start the next round.
 	//
 	// 46:	function OnTimeoutPrecommit(round)
 	// 47:		if round ≥ round_p ∧ decision_p = nil then
-	// 48:			StartRound(round + 1)
-	pure def OnTimeoutPrecommit(ctx: LocalContext, round: Round) : Transition = {
+	// 48:			if 2f + 1 ⟨PRECOMMIT, round, id(v)⟩ with round > valid_p.round then
+	// 49:				valid_p ← (round, id(v))
+	// 50:			StartRound(round + 1)
+	pure def OnTimeoutPrecommit(ctx: LocalContext, params: TimeoutPrecommitParams) : Transition = {
 		val state = ctx.state
+		val round = params.round
 		if (round >= state.round and state.decision == Nil) {
-			StartRound(ctx, round + 1)
+			// Values with a VALID_QUORUM of PRECOMMITs for `round`.
+			val candidates = params.precommits.map(precommit => precommit.value).
+				exclude(Set(Nil)).
+				filter(value => precommits_for_value(params.precommits, value).size() >= VALID_QUORUM)
+			val valid = candidates.getAnyElement(Nil)
+			if (valid != Nil and round > state.valid.round) {
+				val state_with_valid = update_valid(state, round, valid)
+				StartRound({...ctx, state: state_with_valid}, round + 1)
+			} else {
+				StartRound(ctx, round + 1)
+			}
 		} else {
 			no_transition(state)
 		}

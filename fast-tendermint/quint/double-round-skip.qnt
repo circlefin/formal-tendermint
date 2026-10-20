@@ -17,7 +17,9 @@
 // limitations under the License.
 
 /**
- * Lemma 2 violation by skipping rounds, in a scripted execution.
+ * Double round skip, in a scripted execution.
+ * The scenario violates Lemma 2 and Agreement, unless `valid` is updated at
+ * OnTimeoutPrecommit, as in lines 48-50 of the pseudo-code.
  *
  * Two correct processes leave a round without recording the value `v` that
  * can be decided in it: c5 skips round 1 and c1 skips round 2, by running
@@ -36,9 +38,11 @@
  *   quint run double-round-skip.qnt --main double_round_skip \
  *     --init double_round_skip --step step --invariant lemma2 --max-steps 30
  *
- * It passes if OnTimeoutPrecommit does not update `valid`. With the update
- * of lines 48-50 of the pseudo-code, c5 records `v` when it skips round 1,
- * and the execution does not violate Lemma 2.
+ * This scenario is fixed by the update of `valid` at OnTimeoutPrecommit, lines
+ * 48-50 of the pseudo-code: c5 records `v` when it skips round 1, c2-c5 cannot
+ * observe `w` in round 3, and neither Lemma 2 nor Agreement is violated.
+ * Without the update the scenario violates both, as the descriptions of the
+ * runs `lemma2_violated` and `agreement_violated` state.
  */
 module double_round_skip {
 
@@ -107,7 +111,7 @@ module double_round_skip {
 			r => r == round))
 	action timeout_precommit(ps, round) =
 		each(ps, p => micro(p, ft::expired_timeout_precommit, ft::OnTimeoutPrecommit,
-			r => r == round))
+			params => params.round == round))
 
 	/// Lemma 2, as `ft::lemma2`, on the messages and processes of `net`.
 	// `ft::lemma2` reads the state of the choreo instance of `ft`.
@@ -169,10 +173,10 @@ module double_round_skip {
 	/// does. c2-c4 are locked, they precommit nil. c2-c5 observe 2f + 1
 	/// precommits for `w`, and record `(3, w)`, that overrides `(1, v)`.
 	/// Lemma 2 is violated: `v` can be decided in round 1.
+	// FIXED: c5 has recorded `v`, so c2-c5 do not observe `w` and Lemma 2 holds.
 	run lemma2_violated = double_round_skip
 		.then(fresh_proposal(["c1", "c5", "c2", "c3", "c4"], 3, "w"))
-		.then(observation(["c2", "c3", "c4", "c5"]))
-		.expect(not(lemma2))
+		.expect(lemma2)
 
 	/// Agreement is not violated yet, as no process has decided.
 	/// Round 4: c2-c5 leave round 3 with `valid = (3, w)`, and c4, the proposer
@@ -180,13 +184,16 @@ module double_round_skip {
 	/// n - f precommits for `w` and the proposal of round 3, and decide `w`.
 	/// c1, still in round 3, holds the precommits of round 1 and decides `v`.
 	/// Agreement is violated.
+	// FIXED: c4 re-proposes `v` in round 4, all correct processes decide `v`,
+	// and Agreement holds.
 	run agreement_violated = lemma2_violated
 		.then(quorum_any(["c2", "c3", "c4", "c5"], 3))
 		.then(timeout_precommit(["c2", "c3", "c4", "c5"], 3))
+		.then(timeout_prepropose(["c4"], 4))
 		.then(re_proposal(["c2", "c3", "c4", "c5"]))
 		.expect(agreement)
-		.then(decision(["c2", "c3", "c4", "c5"], "w"))
+		.then(decision(["c2", "c3", "c4", "c5"], "v"))
 		.expect(agreement)
 		.then(decision(["c1"], "v"))
-		.expect(not(agreement))
+		.expect(agreement)
 }
