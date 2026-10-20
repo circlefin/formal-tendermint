@@ -677,7 +677,7 @@ module fast_tendermint {
 		val validity_guard = all{
 			state.step == PreProposeStep,
 			round >= 0,
-            round < state.round,
+			round < state.round,
 			certificate.value != Nil,
 		}
 		if (validity_guard and round > valid.round) {
@@ -790,24 +790,30 @@ module fast_tendermint {
 
 	/// Valid round bound: the round of the valid value of a correct process
 	/// is never ahead of the current round of the process.
-    // Violation found: --invariant valid_round_bounded --seed=0x7d19 --max-steps 50.
+	// Violation found: --invariant valid_round_bounded --seed=0x7d19 --max-steps 50.
 	val valid_round_bounded = processes.forall(state => state.valid.round <= state.round)
 
-	/// Lemma 2: If 4f + 1 processes precommit for id(v) in round r (v can be
-	/// decided at round r), then no correct process sets valid = (r′, id(w))
-	/// for any id(w) != id(v) and r′ ≥ r.
-	// This variant considers when the value v is decided in round r.
-	// This core Lemma is the base for the ensuring Agreement.
-	val lemma2 = tuples(processes, processes).forall(((decider, other)) =>
-		match decider.decision {
-			| None => true
-			| Some(value) =>
-				other.valid.value == Nil or
-				other.valid.value == id(value) or
-				// if valid.value != id(value), then valid.round < r
-				other.valid.round < decider.round
-		}
-	)
+	/// Lemma 2: If QUORUM (n - f) processes precommit for id(v) in round r
+	/// (i.e., v can be decided in round r), then no correct process has
+	/// valid = (r′, id(w)) for any id(w) != id(v) and r′ ≥ r.
+	val lemma2 = {
+		val all_precommits = precommits(s.messages)
+		val rounds = all_precommits.map(precommit => precommit.round)
+		val precommitted = all_precommits.map(precommit => precommit.value).exclude(Set(Nil))
+		tuples(rounds, precommitted).forall(((round, value)) => {
+			val senders = all_precommits.filter(precommit => all {
+				precommit.round == round,
+				precommit.value == value,
+			}).map(precommit => precommit.sender)
+			// Nothing to check if value cannot be decided in round
+			size(senders) < QUORUM or
+			processes.forall(process =>
+				process.valid.value == value or
+				// if valid.value != id(v), then valid.round < r
+				process.valid.round < round
+			)
+		})
+	}
 
 	/// Agreement: no two correct processes decide differently.
 	val agreement = tuples(processes, processes).forall(((p1, p2)) =>
