@@ -181,6 +181,37 @@ module fast_tendermint {
 			| Precommit(precommit) => Some(precommit)
 		})
 
+	/// Get the PRECOMMIT messages for `value` from a PRECOMMIT set.
+	// If the PRECOMMITs are for the same round, the senders are unique.
+	pure def precommits_for_value(precommits: Set[PrecommitMessage], value: ValueId): Set[PrecommitMessage] =
+		precommits.filter(precommit => precommit.value == value)
+
+	/// Get at most one PRECOMMIT per sender from a PRECOMMIT set.
+	// Byzantine senders may have several PRECOMMITs, for different values.
+	// Deterministic: the PRECOMMIT kept depends only on the iteration order.
+	pure def one_precommit_per_sender(precommits: Set[PrecommitMessage]): Set[PrecommitMessage] =
+		precommits.fold(Set(), (kept, precommit) =>
+			if (kept.exists(other => other.sender == precommit.sender)) kept
+			else kept.union(Set(precommit))
+		)
+
+	/// Get any element of `elements`, or `default` if it is empty.
+	// Deterministic: the choice depends only on the iteration order of the set.
+	pure def getAnyElement(elements: Set[a], default: a): a =
+		elements.fold(default, (_, element) => element)
+
+	/// Get any subset of `elements` with exactly `k` elements.
+	// Deterministic: the choice depends only on the iteration order of the set.
+	// Panics if `elements` has fewer than `k` elements.
+	pure def getAnySubset(elements: Set[a], k: int): Set[a] = {
+		val subset = elements.fold(Set(), (subset, element) =>
+			if (size(subset) < k) subset.union(Set(element))
+			else subset
+		)
+		if (size(subset) == k) subset
+		else Map().get(Set())
+	}
+
 	/// Fresh-proposal rule: process a PROPOSAL during propose round step.
 	//
 	// 18:	upon ⟨PROPOSAL, round_p, v,−1⟩ from proposer(round_p) while step_p = propose do
@@ -265,7 +296,7 @@ module fast_tendermint {
 	/// Quorum any rule: upon a quorum of PRECOMMITs for a round r, schedule a
 	/// timeout to join the subsequent round r + 1 if round r does not succeed.
 	//
-	// 34:	upon 4f + 1 ⟨PRECOMMIT, r, ∗⟩ for the first time with r ≥ round_p do
+	// 34:	upon n − f ⟨PRECOMMIT, r, ∗⟩ for the first time with r ≥ round_p do
 	pure def quorum_any_rule(ctx: LocalContext) : Set[Set[PrecommitMessage]] = {
 		val state = ctx.state
 		val potential_rounds = precommits(ctx.messages).
@@ -274,8 +305,6 @@ module fast_tendermint {
 		potential_rounds.fold(Set(), (sets, round) =>
 			if (ctx.events.contains({ step: PrecommitStep, round: round }))
 				sets // not the "first time" for round, timeout already scheduled
-			else if (round == state.round and size(observation_rule(ctx)) > 0)
-				sets // the observation rule has priority over quorum any rule
 			else
 				val precommits_for_round = precommits(ctx.messages).
 					filter(precommit => precommit.round == round)
@@ -295,7 +324,7 @@ module fast_tendermint {
 	/// Decision rule: upon a fresh PROPOSAL, carrying a full value `v` and
 	/// with `vr = -1` and a QUORUM of same-round PRECOMMITs for `id(v)`.
 	//
-	// 36: 	upon ⟨PROPOSAL, r, v,−1⟩ from proposer(r) AND 4f + 1 ⟨PRECOMMIT, r′, id(v)⟩ do
+	// 36: 	upon ⟨PROPOSAL, r, v,−1⟩ from proposer(r) AND n − f ⟨PRECOMMIT, r′, id(v)⟩ do
 	pure def decision_rule(ctx: LocalContext) : Set[DecisionParams] = {
 		val state = ctx.state
 		val fresh_proposals = proposals(ctx.messages).filter(
@@ -321,9 +350,10 @@ module fast_tendermint {
 	}
 
 	/// Observation rule pre-proposal: a value becomes valid when it receives
-	/// 2f+1 PRECOMMITs in a round; any previous round can be valid here.
+	/// 2f+1 PRECOMMITs in a round; any previous round can be valid here,
+	/// i.e., a round r with valid_p.round < r < round_p.
 	//
-	// 40: 			if 2f + 1 ⟨PRECOMMIT, r, id(v)⟩ with r > valid_p.round then
+	// 40: 			if 2f + 1 ⟨PRECOMMIT, r, id(v)⟩ with round_p > r > valid_p.round then
 	// 41: 				valid_p ← (r, id(v))
 	//
 	// If the '(valid_p.round < round_p − 1)' condition of the pseudo-code
@@ -333,7 +363,10 @@ module fast_tendermint {
 		val valid = state.valid
 		if (state.step == PreProposeStep)
 			valid_certificates(ctx).filter(
-				certificate => certificate.round > valid.round
+				certificate => all {
+					certificate.round > valid.round,
+					certificate.round < state.round,
+				}
 			)
 		else Set() // listener not currently enabled
 	}
@@ -370,21 +403,43 @@ module fast_tendermint {
 		else Set() // listener not currently enabled
 	}
 
+
+	/// OnTimeoutPrecommit requires the round of the expired timeout and a
+	/// set of PRECOMMIT messages of that round - the quorum any messages.
+	// Conservative approach: exactly QUORUM PRECOMMITs are considered.
+	type TimeoutPrecommitParams = {
+		round:		Round,
+		precommits:	Set[PrecommitMessage],
+	}
+
 	// 46:	function OnTimeoutPrecommit(round)
 	// 47:		if round ≥ round_p ∧ decision_p = nil then
-	pure def expired_timeout_precommit(ctx: LocalContext) : Set[Round] = {
+	// 48:			if 2f + 1 ⟨PRECOMMIT, round, id(v)⟩ with round > valid_p.round then
+	// 49:				valid_p ← (round, id(v))
+	// 50:			StartRound(round + 1)
+	pure def expired_timeout_precommit(ctx: LocalContext) : Set[TimeoutPrecommitParams] = {
 		val state = ctx.state
 		// Timeouts should expire when liveness is ensured past GST
 		val liveness_guard = if (state.round >= GST_ROUND) all {
 			decision_rule(ctx).size() == 0,
-			observation_rule(ctx).size() == 0,
 		} else true // before GST, no liveness guard
-		if (state.decision == Nil and liveness_guard)
-			ctx.events.filter(timeout => all {
+		if (state.decision == Nil and liveness_guard) {
+			val rounds = ctx.events.filter(timeout => all {
 				timeout.step == PrecommitStep,
 				timeout.round >= state.round,
 			}).map(timeout => timeout.round)
-		else Set() // listener not currently enabled
+			rounds.map(round => {
+				round: round,
+				// Any QUORUM of the PRECOMMITs for the round, that must exist
+				// since the timeout was scheduled upon a QUORUM of PRECOMMITs.
+				precommits: getAnySubset(
+					one_precommit_per_sender(
+						precommits(ctx.messages).filter(precommit => precommit.round == round)
+					),
+					QUORUM
+				),
+			})
+		} else Set() // listener not currently enabled
 	}
 
 	// ========= Algorithm ========== //
@@ -399,14 +454,16 @@ module fast_tendermint {
 	pure def scheduleTimeout(step: Step, round: Round) : Set[Effect] =
 		Set(choreo::TriggerEvent({step: step, round: round}))
 
-	/// Update valid value and round, if new round and value allow for.
+	/// Update valid value and round.
+	// Callers must check beforehand that `round >= valid.round`.
+	// Panics otherwise, as the valid round of a process never decreases.
 	pure def update_valid(state: LocalState, round: Round, value: ValueId) : LocalState = {
 		val valid = state.valid
 		if (round >= valid.round) {
 			...state,
 			valid: { round: round, value: value },
 		} else {
-			state
+			Map().get(state)
 		}
 	}
 
@@ -470,9 +527,9 @@ module fast_tendermint {
 	/// Broadcast a fresh proposal or re-broadcast the valid value.
 	//
 	// 11: 		if valid_p.value = nil then
-	// 12: 			proposal ← getValue()
+	// 12: 			proposal ← getValue() ▷ Fresh proposals carry a full value v
 	// 13: 		else
-	// 14: 			proposal ← valid_p.value
+	// 14: 			proposal ← valid_p.value ▷ Re-proposals carry a value identifier id(v)
 	// 15:		broadcast ⟨PROPOSAL, round_p, proposal, valid_p.round⟩
 	pure def broadcast_proposal(state: LocalState): Transition = {
 		val pid = state.process_id
@@ -538,8 +595,11 @@ module fast_tendermint {
 		val state = ctx.state
 		val valid = state.valid
 		if (valid.round <= vr or valid.value == id(v)) {
-			val state_update_valid = update_valid(state, vr, id(v))
-			broadcast_precommit(state_update_valid, id(v))
+			if (valid.round <= vr) {
+				broadcast_precommit(update_valid(state, vr, id(v)), id(v))
+			} else {
+				broadcast_precommit(state, id(v))
+			}
 		} else {
 			broadcast_precommit(state, Nil)
 		}
@@ -582,7 +642,7 @@ module fast_tendermint {
 	/// Quorum any rule: upon a quorum of PRECOMMITs for a round r, schedule a
 	/// timeout to join the subsequent round r + 1 if round r does not succeed.
 	//
-	// 34:	upon 4f + 1 ⟨PRECOMMIT, r, ∗⟩ for the first time with r ≥ round_p do
+	// 34:	upon n − f ⟨PRECOMMIT, r, ∗⟩ for the first time with r ≥ round_p do
 	// 35:		schedule OnTimeoutPrecommit(r) after timeoutPrecommit(r)
 	pure def upon_quorum_any(ctx: LocalContext, msgs: Set[PrecommitMessage]) : Transition = {
 		post_state: ctx.state,
@@ -592,7 +652,7 @@ module fast_tendermint {
 	/// Decision rule: upon a fresh PROPOSAL, carrying a full value `v` and
 	/// with `vr = -1` and a QUORUM of same-round PRECOMMITs for `id(v)`.
 	//
-	// 36: 	upon ⟨PROPOSAL, r, v,−1⟩ from proposer(r) AND 4f + 1 ⟨PRECOMMIT, r′, id(v)⟩ do
+	// 36: 	upon ⟨PROPOSAL, r, v,−1⟩ from proposer(r) AND n − f ⟨PRECOMMIT, r′, id(v)⟩ do
 	// 37:		decision_p ← v
 	pure def upon_decision(ctx: LocalContext, params: DecisionParams) : Transition = {
 		val state = ctx.state
@@ -601,9 +661,8 @@ module fast_tendermint {
 		val validity_guard = (params.proposal.valid_round == -1 and
 			round >= 0 and value != Nil)
 		if (validity_guard and state.decision == Nil) {
-			val state_update_valid = update_valid(state, round, value)
 			{
-				post_state: {...state_update_valid,
+				post_state: {...state,
 					decision: Some(params.proposal.value),
 				},
 				effects: Set(),
@@ -618,7 +677,7 @@ module fast_tendermint {
 	//
 	// 38:	function WaitForValid(timeout)
 	// 39:		while (valid_p.round < round_p − 1) ∧ !timeout.elapsed() do
-	// 40: 			if 2f + 1 ⟨PRECOMMIT, r, id(v)⟩with r > valid_p.round then
+	// 40: 			if 2f + 1 ⟨PRECOMMIT, r, id(v)⟩ with round_p > r > valid_p.round then
 	// 41: 				valid_p ← (r, id(v))
 	//
 	// Modeled in three parts:
@@ -659,9 +718,10 @@ module fast_tendermint {
 	}
 
 	/// Observation rule pre-proposal: a value becomes valid when it receives
-	/// 2f+1 PRECOMMITs in a round; any previous round can be valid here.
+	/// 2f+1 PRECOMMITs in a round; any previous round can be valid here,
+	/// i.e., a round r with valid_p.round < r < round_p.
 	//
-	// 40: 			if 2f + 1 ⟨PRECOMMIT, r, id(v)⟩ with r > valid_p.round then
+	// 40: 			if 2f + 1 ⟨PRECOMMIT, r, id(v)⟩ with round_p > r > valid_p.round then
 	// 41: 				valid_p ← (r, id(v))
 	//
 	// If the '(valid_p.round < round_p − 1)' condition of the pseudo-code
@@ -707,16 +767,30 @@ module fast_tendermint {
 		}
 	}
 
-	/// Upon expiration of timeoutPrecommit(round), if still in the `precommit`
-	/// step, broadcast a PRECOMMIT for `nil` and move to `precommit` step.
+	/// Upon expiration of timeoutPrecommit(round), if the process has not
+	/// decided, update the valid value from a VALID_QUORUM of PRECOMMITs for
+	/// `round` among the QUORUM given, if any, and start the next round.
 	//
 	// 46:	function OnTimeoutPrecommit(round)
 	// 47:		if round ≥ round_p ∧ decision_p = nil then
-	// 48:			StartRound(round + 1)
-	pure def OnTimeoutPrecommit(ctx: LocalContext, round: Round) : Transition = {
+	// 48:			if 2f + 1 ⟨PRECOMMIT, round, id(v)⟩ with round > valid_p.round then
+	// 49:				valid_p ← (round, id(v))
+	// 50:			StartRound(round + 1)
+	pure def OnTimeoutPrecommit(ctx: LocalContext, params: TimeoutPrecommitParams) : Transition = {
 		val state = ctx.state
-		if (state.round == round and state.decision == Nil) {
-			StartRound(ctx, round + 1)
+		val round = params.round
+		if (round >= state.round and state.decision == Nil) {
+			// Values with a VALID_QUORUM of PRECOMMITs for `round`.
+			val candidates = params.precommits.map(precommit => precommit.value).
+				exclude(Set(Nil)).
+				filter(value => precommits_for_value(params.precommits, value).size() >= VALID_QUORUM)
+			val valid = candidates.getAnyElement(Nil)
+			if (valid != Nil and round > state.valid.round) {
+				val state_with_valid = update_valid(state, round, valid)
+				StartRound({...ctx, state: state_with_valid}, round + 1)
+			} else {
+				StartRound(ctx, round + 1)
+			}
 		} else {
 			no_transition(state)
 		}
@@ -755,7 +829,11 @@ module fast_tendermint {
 			map(((pid, value)) =>
 				Precommit({ sender: pid, round: round, value: id(value) })
 			)
-		fresh_proposals.union(precommits).union(re_proposals)
+		// Byzantine processes can also precommit nil
+		val nil_precommits = FAULTY.map(pid =>
+			Precommit({ sender: pid, round: round, value: Nil })
+		)
+		fresh_proposals.union(precommits).union(re_proposals).union(nil_precommits)
 	}
 
 	// ========= Witnesses ========== //
@@ -784,21 +862,34 @@ module fast_tendermint {
 	// Pass `--invariant` with the invariant name to `quint run`.
 	// Multiple `--invariant` parameters can be provided.
 
-	/// Lemma 2: If 4f + 1 processes precommit for id(v) in round r (v can be
-	/// decided at round r), then no correct process sets valid = (r′, id(w))
-	/// for any id(w) != id(v) and r′ ≥ r.
-	// This variant considers when the value v is decided in round r.
-	// This core Lemma is the base for the ensuring Agreement.
-	val lemma2 = tuples(processes, processes).forall(((decider, other)) =>
-		match decider.decision {
-			| None => true
-			| Some(value) =>
-				other.valid.value == Nil or
-				other.valid.value == id(value) or
-				// if valid.value != id(value), then valid.round < r
-				other.valid.round < decider.round
-		}
-	)
+	/// Valid round bound: the round of the valid value of a correct process
+	/// is never ahead of the current round of the process.
+	// Violation found: --invariant valid_round_bounded --seed=0x7d19 --max-steps 50.
+	val valid_round_bounded = processes.forall(state => state.valid.round <= state.round)
+
+	/// Lemma 2: If QUORUM (n - f) processes precommit for id(v) in round r
+	/// (i.e., v can be decided in round r), then no correct process has
+	/// valid = (r′, id(w)) for any id(w) != id(v) and r′ ≥ r.
+	// A previous version violated this invariant with the following setup:
+	// $ quint run double-round-skip.qnt --init double_round_skip --invariant lemma2
+	val lemma2 = {
+		val all_precommits = precommits(s.messages)
+		val rounds = all_precommits.map(precommit => precommit.round)
+		val precommitted = all_precommits.map(precommit => precommit.value).exclude(Set(Nil))
+		tuples(rounds, precommitted).forall(((round, value)) => {
+			val senders = all_precommits.filter(precommit => all {
+				precommit.round == round,
+				precommit.value == value,
+			}).map(precommit => precommit.sender)
+			// Nothing to check if value cannot be decided in round
+			size(senders) < QUORUM or
+			processes.forall(process =>
+				process.valid.value == value or
+				// if valid.value != id(v), then valid.round < r
+				process.valid.round < round
+			)
+		})
+	}
 
 	/// Agreement: no two correct processes decide differently.
 	val agreement = tuples(processes, processes).forall(((p1, p2)) =>
