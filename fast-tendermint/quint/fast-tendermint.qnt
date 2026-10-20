@@ -796,6 +796,8 @@ module fast_tendermint {
 	/// Lemma 2: If QUORUM (n - f) processes precommit for id(v) in round r
 	/// (i.e., v can be decided in round r), then no correct process has
 	/// valid = (r′, id(w)) for any id(w) != id(v) and r′ ≥ r.
+	// The current implementation violates this invariant with the following setup:
+	// $ quint run double-round-skip.qnt --init double_round_skip --invariant lemma2
 	val lemma2 = {
 		val all_precommits = precommits(s.messages)
 		val rounds = all_precommits.map(precommit => precommit.round)
